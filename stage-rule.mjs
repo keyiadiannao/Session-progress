@@ -71,11 +71,14 @@ export function readyEvidence(f) {
 /** progress_stage from facts (what maturity has been GENUINELY reached). */
 export function stageFromFacts(f) {
   if (readyEvidence(f)) return 'ready'
-  // validating is MONOTONIC: once any validation episode passed, the stage stays
-  // validating; a later artifact modification is expressed via mode=rework (and
-  // validationStale flag), NOT by regressing the stage.
-  if (f.validationPassedOnce) return 'validating'
-  if (f.artifactCount >= 2) return 'integrating'
+  // validating requires the validation to be CURRENT: once the artifact is
+  // modified after a pass (validationStale), the stage legitimately drops back —
+  // validated by blind-prefix-agreement (a blind judge marks those "executing").
+  if (f.validationPassedOnce && !f.validationStale) return 'validating'
+  // integrating = MODIFYING an existing artifact (assembly/refinement), NOT merely
+  // having written >=2 distinct files (blind judge marks mere multi-file creation
+  // "executing").
+  if (f.artifactModified) return 'integrating'
   if (f.artifactCount >= 1) return 'first_output'
   if (f.toolCallsTotal > 0) return 'executing'
   return 'planned'

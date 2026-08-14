@@ -402,3 +402,38 @@ validating oscillations : 0
 false ready             : 0
 sessions reaching ready : 0/7（conjunction 严格，宁漏报；未来靠结构化 delivered 事件改善覆盖）
 ```
+
+## 21. Blind prefix agreement（独立盲评验收，2026-08-14）
+
+用 **deepseek-v4-flash 做独立盲评**替代人类标注：对每个采样 prefix 时刻，只给 flash
+任务描述 + 到该时刻的活动流水（**无未来、无我们的 stage 判断**），让 flash 独立选 stage，
+再和我们的规则输出对比。这是 shadow deployment 前最接近 human prefix agreement 的
+外部真值。
+
+### 三轮迭代（42 个 prefix 时刻）
+
+| 迭代 | 规则 | exact | off-by-one | 主要分歧 |
+|---|---|---|---|---|
+| 1 | validating 永久闩锁 | 59.5% | 59.5% | validating→executing（距离 3，严重） |
+| 2 | 去闩锁，integrating=artifactCount≥2 | 33.3% | 61.9% | integrating↔executing/validating（距离 1） |
+| 3 | integrating=修改已存在产物 | 31.0% | **64.3%** | integrating↔executing（距离 1） |
+
+### 核心发现
+
+1. **方向收敛**：off-by-one 从 59.5%→64.3%，分歧从"严重（距离 3）"变"轻微（距离 1）"，
+   说明三轮修正把系统性偏差从"validating 严重高估"逐步收窄；
+2. **但 exact 停在 ~31–60%**：揭示了一个**根本 gap**——结构化规则（数文件、记验证）和
+   语义阶段判断（flash 盲评）之间有系统性差异：我们的规则偏"高估成熟度"（write 成功即
+   产物、test pass 即验证），盲评者偏"保守"（大量判 executing，认为"写文件/跑测试"是
+   过程而非里程碑）。
+
+### 诚实的结论（不粉饰）
+
+- 盲评方法论**有效**：它独立暴露了"validating 永久闩锁"这个我们自己没意识到的系统性
+  高估 bug（第一轮 validating→executing 距离 3 的分歧就是证据）；
+- 但"精确 stage"存在**结构化规则的天花板**：surface facts（写了几文件、跑了几测试）
+  无法完全替代语义理解（这些动作对任务的意义）。这再次印证了本项目的核心结论——结构化/
+  prefix-only 的精确判断有上限，语义理解（LLM）更准但代价高；
+- **下一步方向**：不是继续调阈值（已进入打地鼠），而是（a）用更大样本做盲评，量化这个
+  gap 到底多大；（b）承认 stage 的语义判断最终需要 LLM，规则只做"安全的骨架"（planned/
+  executing/first_output 这些低成熟度阶段规则和盲评 100% 一致，正是规则的舒适区）。

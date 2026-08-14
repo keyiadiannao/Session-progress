@@ -233,6 +233,7 @@ export function evaluateSession(events, now = Date.now()) {
     activities: [],
     // ---- semantic facts (for stage/mode rule) ----
     artifacts: new Set(),          // DISTINCT successfully-created artifact paths
+    artifactModified: false,       // a write MODIFIED an existing artifact (integration signal)
     artifactRevision: 0,           // increments on every successful write (create OR modify)
     validatedRevision: 0,          // artifact revision at the last validation PASS
     validationPassedOnce: false,   // any validation episode ever passed (monotonic)
@@ -295,7 +296,9 @@ export function evaluateSession(events, now = Date.now()) {
       if (lt?.category === 'write') {
         const p = lt.args?.file_path || lt.args?.path
         if (p && success) {
-          if (!state.artifacts.has(p)) {
+          if (state.artifacts.has(p)) {
+            state.artifactModified = true // modifying an existing artifact = integration
+          } else {
             state.artifacts.add(p)
             state.files.push({ path: p, ext: path.extname(p) })
           }
@@ -388,6 +391,7 @@ export function evaluateSession(events, now = Date.now()) {
   const facts = {
     toolCallsTotal: state.toolCalls.length,
     artifactCount: state.artifacts.size,
+    artifactModified: state.artifactModified, // an existing artifact was modified (integration)
     validationPassedOnce: state.validationPassedOnce,
     validationStale: state.validationPassedOnce && state.artifactRevision > state.validatedRevision, // stale only after a pass
     validationJustFailed: state.validationJustFailed,
@@ -397,8 +401,8 @@ export function evaluateSession(events, now = Date.now()) {
     recentErrors: recentErrCount,
     lastToolCategory: state.lastTool?.category || null,
   }
-  const stage = events.length === 0 ? 'no-data' : stageFromFacts(facts)
-  const mode = modeFromFacts(facts)
+  const stage = events.length === 0 ? 'no-data' : (status === 'completed' ? 'ready' : stageFromFacts(facts))
+  const mode = status === 'completed' ? 'delivering' : modeFromFacts(facts)
   const band = BAND[stage] ?? null
 
   // ---- current % estimate: lightweight model (prefix facts -> %), ZERO LLM ----
@@ -412,7 +416,10 @@ export function evaluateSession(events, now = Date.now()) {
     percentBasis = 'completed'
   } else if (PERCENT_MODEL) {
     const mf = modelFeatures(snap, band)
-    percent = Math.round(Math.max(0, Math.min(100, treePredict(PERCENT_MODEL.tree, mf))))
+    const pred = treePredict(PERCENT_MODEL.tree, mf)
+    // clamp the model's centre estimate INTO the stage band, so the centre never
+    // falls outside the interval it is meant to refine (e.g. 66% vs 80–92%).
+    percent = band ? Math.round(Math.max(band[0], Math.min(band[1], pred))) : Math.round(Math.max(0, Math.min(100, pred)))
     percentBasis = 'model'
   } else if (todoRatio !== null) {
     percent = Math.round(todoRatio * 100); percentBasis = 'plan'

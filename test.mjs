@@ -24,13 +24,14 @@ const check = (name, cond, extra = '') => {
 
 // ================================================================ stage-rule unit
 console.log('--- stageFromFacts / modeFromFacts ---')
-const baseFacts = { toolCallsTotal: 1, artifactCount: 0, validationPassedOnce: false, validationStale: false, validationJustFailed: false, validationInProgress: false, readyClaim: false, todoRatio: null, recentErrors: 0, lastToolCategory: 'inspect' }
+const baseFacts = { toolCallsTotal: 1, artifactCount: 0, artifactModified: false, validationPassedOnce: false, validationStale: false, validationJustFailed: false, validationInProgress: false, readyClaim: false, todoRatio: null, recentErrors: 0, lastToolCategory: 'inspect' }
 check('no facts -> planned', stageFromFacts({ ...baseFacts, toolCallsTotal: 0 }) === 'planned')
 check('tools only -> executing', stageFromFacts(baseFacts) === 'executing')
 check('1 artifact -> first_output', stageFromFacts({ ...baseFacts, artifactCount: 1 }) === 'first_output')
-check('2 artifacts -> integrating', stageFromFacts({ ...baseFacts, artifactCount: 2 }) === 'integrating')
+check('2 distinct artifacts (no modification) -> still first_output', stageFromFacts({ ...baseFacts, artifactCount: 2 }) === 'first_output')
+check('artifactModified -> integrating', stageFromFacts({ ...baseFacts, artifactModified: true, artifactCount: 1 }) === 'integrating')
 check('validation passed once -> validating', stageFromFacts({ ...baseFacts, validationPassedOnce: true }) === 'validating')
-check('validation stale -> stage still validating (monotonic)', stageFromFacts({ ...baseFacts, validationPassedOnce: true, validationStale: true }) === 'validating')
+check('validation stale -> NOT validating', stageFromFacts({ ...baseFacts, validationPassedOnce: true, validationStale: true }) !== 'validating')
 check('todoRatio 0.6 with 0 artifacts -> NOT integrating', stageFromFacts({ ...baseFacts, todoRatio: 0.6, artifactCount: 0 }) === 'executing')
 check('readyClaim alone (no artifact) -> NOT ready', stageFromFacts({ ...baseFacts, readyClaim: true, artifactCount: 0 }) !== 'ready')
 check('readyClaim + artifact + no blocker -> ready', stageFromFacts({ ...baseFacts, readyClaim: true, artifactCount: 1, recentErrors: 0 }) === 'ready')
@@ -75,20 +76,20 @@ function testPair(t, passed) {
   check('failed write -> artifactCount 0', a.derived.produced_artifact === false)
 }
 
-// --- P0: successful write -> first_output; dedup by path ---
+// --- P0: successful write -> first_output; same path twice -> integrating (modify) ---
 {
   const ev = [
     mk('turn/start', 0, { turn: 1 }),
-    mk('user/message', 1, { content: '写两个文件' }),
+    mk('user/message', 1, { content: '写文件' }),
     ...writePair(10, '/x/a.py', true),
-    ...writePair(20, '/x/a.py', true), // same path again -> dedup
+    ...writePair(20, '/x/a.py', true), // same path again -> MODIFY -> integrating
   ]
   const a = evaluateSession(ev, t0 + 2000)
-  check('successful write -> first_output', a.stage === 'first_output', a.stage)
-  check('same path written twice -> still first_output (dedup)', a.stage !== 'integrating', a.stage)
+  check('first write -> first_output', evaluateSession(ev.slice(0, 4), t0 + 2000).stage === 'first_output')
+  check('same path written twice -> integrating (modify, not dedup-invisible)', a.stage === 'integrating', a.stage)
 }
 
-// --- P0: two DISTINCT successful writes -> integrating ---
+// --- P0: two DISTINCT writes -> first_output (not integrating) ---
 {
   const ev = [
     mk('turn/start', 0, { turn: 1 }),
@@ -97,7 +98,7 @@ function testPair(t, passed) {
     ...writePair(20, '/x/b.py', true),
   ]
   const a = evaluateSession(ev, t0 + 2000)
-  check('two distinct artifacts -> integrating', a.stage === 'integrating', a.stage)
+  check('two distinct artifacts -> first_output (not integrating)', a.stage === 'first_output', a.stage)
 }
 
 // --- P0: any .md alone does NOT mean ready ---
@@ -158,7 +159,7 @@ function testPair(t, passed) {
     ...writePair(30, '/x/a.py', true),   // modify -> rev 2, validation stale
   ]
   const a = evaluateSession(ev, t0 + 2000)
-  check('pass then modify -> stage STAYS validating (monotonic)', a.stage === 'validating', a.stage)
+  check('pass then modify -> stage drops off validating (stale, back to integrating)', a.stage === 'integrating', a.stage)
   check('pass then modify -> mode = rework (stale)', a.mode === 'rework', a.mode)
 }
 
