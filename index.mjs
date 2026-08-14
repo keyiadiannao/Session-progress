@@ -249,9 +249,11 @@ export function evaluateSession(events, now = Date.now()) {
     testsFailed: 0,
     firstEventTime: null,
     lastEventTime: null,
+    lastEventType: null,
   }
 
   for (const e of events) {
+    state.lastEventType = e.type
     if (typeof e.time === 'number') {
       if (state.firstEventTime === null) state.firstEventTime = e.time
       state.lastEventTime = e.time
@@ -354,8 +356,15 @@ export function evaluateSession(events, now = Date.now()) {
   // status
   let status = 'no-data'
   if (events.length > 0) {
-    if (state.turnOpen) status = idleSec != null && idleSec > 60 ? 'stalled' : 'running'
-    else status = state.lastTurnReason === 'completed' ? 'completed' : state.lastTurnReason ? `ended:${state.lastTurnReason}` : 'idle'
+    if (state.turnOpen) {
+      // Race-condition fallback: if the agent has emitted its final reply
+      // (last event is assistant/message) and been idle a few seconds, treat
+      // the turn as completed even before the turn/end event flushes to disk.
+      if (state.lastEventType === 'assistant/message' && idleSec != null && idleSec > 3) status = 'completed'
+      else status = idleSec != null && idleSec > 60 ? 'stalled' : 'running'
+    } else {
+      status = state.lastTurnReason === 'completed' ? 'completed' : state.lastTurnReason ? `ended:${state.lastTurnReason}` : 'idle'
+    }
   }
 
   // plan progress from the agent's own todos
