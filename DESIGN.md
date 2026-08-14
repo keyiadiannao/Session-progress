@@ -175,19 +175,21 @@ raw prefix events
 ## 13. 最终架构（v4，规则 + 轻量模型）
 
 诊断的终点不是"放弃 ML"，而是给出唯一正确的闭环：**大模型只做离线标注，
-运行时用轻量模型**。
+运行时用轻量模型**。命名统一（2026-08-14 第二轮 review 后）：
 
 ```
 [离线，一次]
-  完整轨迹 ──flash 全轨迹标注──▶ 每个采样时刻的真实 %  (ground truth)
+  完整轨迹 ──flash 全轨迹标注──▶ retrospective completion estimate（回顾性完成度估计）
+                                    NOT progress ground truth（不是进度真值）
                                      │
   前缀 facts（≤t）──▶ 训练决策树回归 ──▶ percent-model.json（67 节点，零依赖）
 [运行时，零大模型]
-  当前会话日志 ──▶ 前缀 facts ──▶ 树遍历预测 ──▶ 当前 % + 进度条
+  当前会话日志 ──▶ 前缀 facts ──▶ 树遍历预测 ──▶ completion forecast（完成度预测，次要）
+  progress_stage + evidence ──▶ 主进度信号（阶段 band + 已完成事实）
 ```
 
-**为什么这样不循环**：标签是 flash 看**完整轨迹**独立判断的 %（不是规则生成），
-模型学的是"前缀 facts → 真实 %"的映射，不是"规则 → 规则"。
+**为什么这样不循环**：离线标注是 flash 看**完整轨迹**的回顾性估计（不是规则生成），
+模型学的是"前缀 facts → 回顾性完成度"的映射，不是"规则 → 规则"。
 
 **实测**（leave-one-session-out MAE，123 会话 721 标注）：
 
@@ -250,11 +252,12 @@ verified facts → workflow state → provisional plan → remaining-work foreca
 
 ## 16. 最终落地形态（v5，诚实区间）
 
-采纳"证据 + 区间"而非"精确 %"：
+采纳"证据 + 区间"而非"精确 %"。命名统一（见 §13）：
 
-- **主显示**：模型中心估计 `~90%`（轻量决策树，标注 ±约 19pp）；
-- **区间**：阶段 band `92–99%`（前缀事实，可辩护）；
-- **进度条**：高亮 band 区间段 + 模型中心填充点；
+- **主进度信号**：`progress_stage`（阶段，事实）+ `progress_band`（阶段区间，事实投影）；
+- **次要信号**：`completion_forecast`（模型中心估计 `~90%`，轻量决策树，标注 ±约 19pp，
+  预测性/不确定，视觉降级为 secondary，绝不作主进度）；
+- **进度条**：高亮 band 区间段 + forecast 中心填充点；
 - **事实行**：`已写 N 文件 · 测试通过/失败 M · 已做 K 步`；
 - **终端状态**：turn 正常结束（status=completed）才报 100%；
 - **新会话**：`pickActiveSession` 自动切换最新会话，`evaluateSession` 每次从头
@@ -345,3 +348,57 @@ false ready             : 0（收紧后；收紧前 6/7）
 
 `test.mjs` 重写为匹配新 ontology（33 项断言），覆盖上述全部 P0 修复 + zstd round-trip。
 `package.json` 增加 `scripts.test`（`npm test` 或 `node test.mjs`）。
+
+## 20. Runtime state machine v3（Sprint 2，四个核心语义）
+
+第二轮 review 指出四个必须修的地方，本轮继续**完全不碰 ML**：
+
+### ① result ↔ call 精确关联（P0）
+
+DSH 事件有原生 `callId`（`tool/call.data.callId` ↔ `tool/result.message.source.callId`）。
+原来用 `state.lastTool` 配对，遇到并行/交错 call 会串。改为 `pendingCalls Map` 按
+callId join；顺带用 `tool/result.content[0].isError` 作为**权威错误信号**（fallback
+regex）。Claude adapter 本就正确（`pending Map + tool_use_id`），现在 DSH 也一致。
+
+### ② validation 绑定 candidate revision
+
+引入 `artifactRevision`（每次成功写 +1）与 `validatedRevision`（验证通过时记录）。
+`validationStale = validationPassedOnce && artifactRevision > validatedRevision`。
+
+- stage **保持单调**：`validating` 只由 `validationPassedOnce`（闩锁）触发，不因 stale
+  回退（第一轮 review 的"stage 不倒退"仍然成立）；
+- stale 通过 **`mode = rework`** 表达（第二轮 review："UI 不能把旧 test pass 当当前已验证"）。
+
+### ③ ready 从 claim 升级为 evidence conjunction
+
+`ready` 不再由裸 claim 触发，而是：
+
+```
+ready_claim（visible claim，非 fact）
++ artifactCount >= 1
++ !validationStale（当前候选已验证）
++ !validationJustFailed
++ recentErrors === 0
+→ readyEvidence
+```
+
+### ④ 删除 todoRatio → integrating 硬跳转
+
+`integrating` 只由 `artifactCount >= 2`（或显式整合事件）触发；todo 完成率只作
+within-stage evidence / plan coverage，不再提升 milestone。
+
+### 命名统一（§13/§16）
+
+- full-trajectory LLM `%` label → **retrospective completion estimate**（不是 progress
+  ground truth）；
+- percent-model 预测 → **completion forecast**（secondary / 低置信）；
+- `progress_stage + evidence` → **primary live progress**。
+
+### replay 验证（7 个真实 DSH session）
+
+```
+stage regressions       : 0 / 224 (0.0%)   ← 单调性成立
+validating oscillations : 0
+false ready             : 0
+sessions reaching ready : 0/7（conjunction 严格，宁漏报；未来靠结构化 delivered 事件改善覆盖）
+```

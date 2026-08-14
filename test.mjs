@@ -24,20 +24,23 @@ const check = (name, cond, extra = '') => {
 
 // ================================================================ stage-rule unit
 console.log('--- stageFromFacts / modeFromFacts ---')
-const baseFacts = { toolCallsTotal: 1, artifactCount: 0, validationPassedOnce: false, validationJustFailed: false, validationInProgress: false, readyEvidence: false, todoRatio: null, recentErrors: 0, lastToolCategory: 'inspect' }
+const baseFacts = { toolCallsTotal: 1, artifactCount: 0, validationPassedOnce: false, validationStale: false, validationJustFailed: false, validationInProgress: false, readyClaim: false, todoRatio: null, recentErrors: 0, lastToolCategory: 'inspect' }
 check('no facts -> planned', stageFromFacts({ ...baseFacts, toolCallsTotal: 0 }) === 'planned')
 check('tools only -> executing', stageFromFacts(baseFacts) === 'executing')
 check('1 artifact -> first_output', stageFromFacts({ ...baseFacts, artifactCount: 1 }) === 'first_output')
 check('2 artifacts -> integrating', stageFromFacts({ ...baseFacts, artifactCount: 2 }) === 'integrating')
 check('validation passed once -> validating', stageFromFacts({ ...baseFacts, validationPassedOnce: true }) === 'validating')
-check('ready evidence -> ready', stageFromFacts({ ...baseFacts, readyEvidence: true }) === 'ready')
-check('any .md alone does NOT -> ready (no readyEvidence)', stageFromFacts({ ...baseFacts, artifactCount: 1 }) === 'first_output')
+check('validation stale -> stage still validating (monotonic)', stageFromFacts({ ...baseFacts, validationPassedOnce: true, validationStale: true }) === 'validating')
+check('todoRatio 0.6 with 0 artifacts -> NOT integrating', stageFromFacts({ ...baseFacts, todoRatio: 0.6, artifactCount: 0 }) === 'executing')
+check('readyClaim alone (no artifact) -> NOT ready', stageFromFacts({ ...baseFacts, readyClaim: true, artifactCount: 0 }) !== 'ready')
+check('readyClaim + artifact + no blocker -> ready', stageFromFacts({ ...baseFacts, readyClaim: true, artifactCount: 1, recentErrors: 0 }) === 'ready')
+check('readyClaim + artifact + recent error -> NOT ready', stageFromFacts({ ...baseFacts, readyClaim: true, artifactCount: 1, recentErrors: 1 }) !== 'ready')
 check('stage order planned < ... < ready', stageIndex('planned') < stageIndex('first_output') && stageIndex('validating') < stageIndex('ready'))
 check('maxStage keeps higher', maxStage('validating', 'integrating') === 'validating')
 
 check('mode: validation just failed -> rework', modeFromFacts({ ...baseFacts, validationPassedOnce: true, validationJustFailed: true }) === 'rework')
 check('mode: test in progress -> validating', modeFromFacts({ ...baseFacts, validationInProgress: true, lastToolCategory: 'run' }) === 'validating')
-check('mode: ready -> delivering', modeFromFacts({ ...baseFacts, readyEvidence: true }) === 'delivering')
+check('mode: ready -> delivering', modeFromFacts({ ...baseFacts, readyClaim: true, artifactCount: 1, recentErrors: 0 }) === 'delivering')
 check('mode: recent errors >=2 -> rework', modeFromFacts({ ...baseFacts, recentErrors: 2 }) === 'rework')
 
 // ================================================================ evaluateSession
@@ -143,6 +146,34 @@ function testPair(t, passed) {
   const a = evaluateSession(ev, t0 + 2000)
   check('stage stays validating after later failure', a.stage === 'validating', a.stage)
   check('mode = rework after later failure', a.mode === 'rework', a.mode)
+}
+
+// --- P0: validation goes stale after artifact modification (mode, not stage) ---
+{
+  const ev = [
+    mk('turn/start', 0, { turn: 1 }),
+    mk('user/message', 1, { content: '改代码 + 测试' }),
+    ...writePair(10, '/x/a.py', true),   // artifact revision 1
+    ...testPair(20, true),               // pass -> validating (bound to rev 1)
+    ...writePair(30, '/x/a.py', true),   // modify -> rev 2, validation stale
+  ]
+  const a = evaluateSession(ev, t0 + 2000)
+  check('pass then modify -> stage STAYS validating (monotonic)', a.stage === 'validating', a.stage)
+  check('pass then modify -> mode = rework (stale)', a.mode === 'rework', a.mode)
+}
+
+// --- P0: pass then modify then re-pass -> validating again (fresh) ---
+{
+  const ev = [
+    mk('turn/start', 0, { turn: 1 }),
+    mk('user/message', 1, { content: '改代码 + 测试' }),
+    ...writePair(10, '/x/a.py', true),
+    ...testPair(20, true),
+    ...writePair(30, '/x/a.py', true),   // stale
+    ...testPair(40, true),               // re-validate current rev -> fresh again
+  ]
+  const a = evaluateSession(ev, t0 + 2000)
+  check('re-validate after modify -> mode not rework (fresh again)', a.mode !== 'rework', a.mode)
 }
 
 // --- basic status/task/todo/errors/usage still work ---

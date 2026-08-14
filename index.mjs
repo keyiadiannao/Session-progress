@@ -153,6 +153,21 @@ function extractToolText(message) {
   return walk(message).slice(0, 8000)
 }
 
+/**
+ * Extract ONLY the tool-result payload text (skips the {source, toolCallId}
+ * envelope so call ids never leak into error detection / activity summaries).
+ * Returns { text, isError }.
+ */
+function extractResult(message) {
+  const block = message?.content?.[0]
+  const inner = block?.content
+  let text
+  if (typeof inner === 'string') text = inner
+  else if (Array.isArray(inner)) text = inner.map((c) => (c?.type === 'text' ? c.text : '')).join('\n')
+  else text = extractToolText(message)
+  return { text: text.slice(0, 8000), isError: block?.isError === true }
+}
+
 function extractUserText(content) {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) return content.map((c) => (c?.type === 'text' ? c.text : '')).join(' ')
@@ -211,16 +226,19 @@ export function evaluateSession(events, now = Date.now()) {
     lastTodoAt: 0,
     toolCalls: [],
     lastTool: null,
+    pendingCalls: new Map(), // callId -> call info (exact result<->call association)
     errors: [],
     lastResults: [], // rolling window of { error } for the most recent tool results
     usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0 },
     activities: [],
     // ---- semantic facts (for stage/mode rule) ----
     artifacts: new Set(),          // DISTINCT successfully-created artifact paths
+    artifactRevision: 0,           // increments on every successful write (create OR modify)
+    validatedRevision: 0,          // artifact revision at the last validation PASS
     validationPassedOnce: false,   // any validation episode ever passed (monotonic)
     validationJustFailed: false,   // most recent validation episode failed
     validationInProgress: false,   // a test run is currently the last tool
-    readyEvidence: false,          // ready_to_deliver claim seen
+    readyClaim: false,             // ready_to_deliver claim seen (a CLAIM, not a fact)
     visibleClaims: [],             // extracted assistant-text claims
     // ---- cumulative counters (only for the offline percent model features) ----
     files: [],
@@ -245,28 +263,35 @@ export function evaluateSession(events, now = Date.now()) {
     else if (t === 'todo/write' && Array.isArray(e.data?.todos)) { state.todos = e.data.todos; state.lastTodoAt = e.time ?? 0 }
     else if (t === 'tool/call') {
       const name = e.data?.name ?? '?'
+      const callId = e.data?.callId
       const cat = category(name)
       let args = e.data?.arguments
       if (typeof args === 'string') { try { args = JSON.parse(args) } catch { args = {} } }
       const argSum = (args?.file_path || args?.command || args?.pattern || args?.query || '')?.toString().slice(0, 80) || ''
       const action = actionSummary(name, args)
-      state.toolCalls.push({ name, time: e.time, category: cat, args_summary: argSum, action })
-      state.lastTool = { name, time: e.time, category: cat, args_summary: argSum, action, args }
+      const callInfo = { name, time: e.time, category: cat, args_summary: argSum, action, args, callId }
+      state.toolCalls.push(callInfo)
+      state.lastTool = callInfo // fallback for results that lack a callId
+      if (callId) state.pendingCalls.set(callId, callInfo)
       // NOTE: artifact is NOT recorded here — it is recorded only on a SUCCESSFUL
-      // tool/result (P0 fix: a failed write must not count as first_output).
+      // tool/result (a failed write must not count as first_output).
       if (cat === 'run' && isTestCommand(name, args)) state.validationInProgress = true
     } else if (t === 'tool/result') {
-      const text = extractToolText(e.data?.message)
-      const isErr = ERROR_PATTERN.test(text)
+      // P0: associate result with its call by callId, NOT by lastTool (handles
+      // parallel / interleaved tool calls).  isError field is authoritative.
+      const callId = e.data?.message?.source?.callId
+      const lt = (callId && state.pendingCalls.get(callId)) || state.lastTool
+      const { text, isError: explicitErr } = extractResult(e.data?.message)
+      const isErr = explicitErr || ERROR_PATTERN.test(text)
       const success = !isErr
-      state.lastResults.push({ error: isErr, time: e.time, name: state.lastTool?.name ?? '?' })
+      state.lastResults.push({ error: isErr, time: e.time, name: lt?.name ?? '?' })
       if (state.lastResults.length > 6) state.lastResults.shift()
       // semantic activity log: "做了什么 → 结果如何"
-      state.activity.push({ action: state.lastTool?.action || state.lastTool?.name, result: resultSummary(text), ok: success })
+      state.activity.push({ action: lt?.action || lt?.name, result: resultSummary(text), ok: success })
       if (state.activity.length > 30) state.activity.shift()
+      if (callId) state.pendingCalls.delete(callId)
 
-      const lt = state.lastTool
-      // artifact: ONLY on a SUCCESSFUL write, deduped by path (P0 fix)
+      // artifact: ONLY on a SUCCESSFUL write, deduped by path
       if (lt?.category === 'write') {
         const p = lt.args?.file_path || lt.args?.path
         if (p && success) {
@@ -275,15 +300,17 @@ export function evaluateSession(events, now = Date.now()) {
             state.files.push({ path: p, ext: path.extname(p) })
           }
           state.writesSucceeded += 1 // cumulative, for the offline model features
+          state.artifactRevision += 1 // every successful write (create OR modify) advances revision
         }
       }
-      // validation episode: each test run closes the episode and updates state (P0 fix)
+      // validation episode: each test run closes the episode and updates state
       if (lt?.category === 'run' && state.validationInProgress) {
         state.validationInProgress = false
         const passed = success && !/failed|error/i.test(text)
         if (passed) {
           state.validationPassedOnce = true // monotonic: once passed, stage never regresses
           state.validationJustFailed = false
+          state.validatedRevision = state.artifactRevision // bind validation to the current revision
         } else {
           state.validationJustFailed = true // mode goes rework, stage stays
         }
@@ -293,7 +320,7 @@ export function evaluateSession(events, now = Date.now()) {
       if (isErr) {
         state.errors.push({
           time: e.time,
-          name: state.lastTool?.name ?? '?',
+          name: lt?.name ?? '?',
           snippet: text.replace(/\s+/g, ' ').slice(0, 260),
         })
       }
@@ -307,7 +334,7 @@ export function evaluateSession(events, now = Date.now()) {
       }
       // semantic evidence: visible claims (ready_to_deliver etc.) from assistant TEXT
       for (const c of extractClaims(e.data?.message?.content)) {
-        if (c.type === 'ready_to_deliver') state.readyEvidence = true
+        if (c.type === 'ready_to_deliver') state.readyClaim = true
         state.visibleClaims.push(c)
         if (state.visibleClaims.length > 15) state.visibleClaims.shift()
       }
@@ -362,9 +389,10 @@ export function evaluateSession(events, now = Date.now()) {
     toolCallsTotal: state.toolCalls.length,
     artifactCount: state.artifacts.size,
     validationPassedOnce: state.validationPassedOnce,
+    validationStale: state.validationPassedOnce && state.artifactRevision > state.validatedRevision, // stale only after a pass
     validationJustFailed: state.validationJustFailed,
     validationInProgress: state.validationInProgress,
-    readyEvidence: state.readyEvidence, // ready_to_deliver claim only (completed turn is a 100% terminal, not stage=ready)
+    readyClaim: state.readyClaim, // a visible claim, corroborated in stage-rule readyEvidence()
     todoRatio,
     recentErrors: recentErrCount,
     lastToolCategory: state.lastTool?.category || null,
