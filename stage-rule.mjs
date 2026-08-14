@@ -3,20 +3,25 @@
  *
  * Stage and mode are computed from SEMANTIC FACTS.  Key invariants (Sprint 2):
  *
- *   - `integrating` requires >= 2 DISTINCT artifacts (or explicit assembly
- *     evidence).  A todo ratio >= 0.6 is ONLY within-stage evidence, it never
- *     promotes the milestone (a plan can be 60% done with zero artifacts).
+ *   - `integrating` requires MODIFYING an existing artifact
+ *     (`artifactModified`), NOT merely having created >= 2 distinct files.
+ *     A todo ratio is ONLY within-stage evidence; it never promotes the
+ *     milestone (a plan can be 60% done with zero artifacts).  This follows
+ *     DESIGN.md §21 iteration 3 (the blind judge marks mere multi-file
+ *     creation "executing"), superseding §20④'s "artifactCount >= 2".
  *   - `validating` requires that validation PASSED AND the validated artifact
  *     revision is still CURRENT (validationStale == false).  Once the artifact
- *     is modified after a pass, validation evidence goes stale.
+ *     is modified after a pass, validation evidence goes stale and the stage
+ *     drops: the permanent `validationPassedOnce` latch was REMOVED after
+ *     DESIGN.md §21 iteration 2 ("去闩锁"), superseding §20②'s monotonic latch.
  *   - `ready` is a CONJUNCTION, not a bare claim: ready_claim (a visible claim,
  *     not a fact) AND >= 1 artifact AND no unresolved blocker AND (when
  *     validation applies) the current candidate validated.
  *
- * `stageFromFacts` is pure; monotonicity is NOT enforced here.  In practice the
- * validating branch stays latched via validationPassedOnce, but validationStale
- * and the ready conjunction can legitimately lower a stage — intentional, see
- * DESIGN.md §20.
+ * `stageFromFacts` is pure.  Monotonicity is NOT enforced: `validationStale`
+ * (validating -> below) and the ready conjunction legitimately lower the stage.
+ * This is the post-§21 semantics (DESIGN.md §21 iteration 2, "去闩锁"), which
+ * supersedes §20's monotonic latch.
  *
  * facts shape (produced by index.mjs evaluateSession):
  * {

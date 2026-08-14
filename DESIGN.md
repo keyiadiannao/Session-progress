@@ -369,6 +369,10 @@ regex）。Claude adapter 本就正确（`pending Map + tool_use_id`），现在
   回退（第一轮 review 的"stage 不倒退"仍然成立）；
 - stale 通过 **`mode = rework`** 表达（第二轮 review："UI 不能把旧 test pass 当当前已验证"）。
 
+> **被 §21 取代**：盲评（§21 迭代 2）发现"永久闩锁"会高估成熟度（validating→executing
+> 距离 3），遂**去闩锁**——`validating` 改为 `validationPassedOnce && !validationStale`，
+> stale 会回退阶段。最终实现见 `stage-rule.mjs`。
+
 ### ③ ready 从 claim 升级为 evidence conjunction
 
 `ready` 不再由裸 claim 触发，而是：
@@ -386,6 +390,10 @@ ready_claim（visible claim，非 fact）
 
 `integrating` 只由 `artifactCount >= 2`（或显式整合事件）触发；todo 完成率只作
 within-stage evidence / plan coverage，不再提升 milestone。
+
+> **被 §21 取代**：盲评（§21 迭代 3）发现"多文件创建"被盲评者判为 executing，遂把
+> `integrating` 改为 **`artifactModified`（修改已存在产物）**，off-by-one 从 61.9%→64.3%。
+> 最终实现见 `stage-rule.mjs`。
 
 ### 命名统一（§13/§16）
 
