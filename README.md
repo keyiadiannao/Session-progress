@@ -73,8 +73,22 @@ start-dashboard.bat
 若要用自己的数据重训,需要 `DEEPSEEK_API_KEY`,跑:
 
 ```bash
-node annotate-percent.mjs    # flash 全轨迹标注 %(离线,唯一用大模型的地方)
-python export-model.py       # 训练决策树 → percent-model.json
+node research/annotate-percent.mjs   # flash 全轨迹标注 %(离线,唯一用大模型的地方)
+python research/export-model.py      # 训练决策树 → percent-model.json
+```
+
+## 目录结构
+
+```
+index.mjs                  # 入口:实时 dashboard 服务
+stage-rule.mjs             # 阶段规则(prefix-only,零成本)
+summarize.mjs / summarizer.mjs / llm.mjs   # 语义提取 + 总结 + 离线 LLM 客户端
+extractor-v2*.mjs / *-extract.mjs          # 会话日志 → 结构化快照(DSH + Claude)
+percent-model.json         # 67 节点决策树(示例模型)
+config.example.json        # 配置模板
+DESIGN.md                  # 设计文档 + 完整证据链
+research/                  # 研究脚本:精确 % 不可行结论的可复现记录
+research/archive/          # 被取代的早期版本
 ```
 
 ## 文档
