@@ -23,7 +23,7 @@ import path from 'node:path'
 import os from 'node:os'
 import { zstdDecompressSync } from 'node:zlib'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { stagePrefix, modePrefix, BAND } from './stage-rule.mjs'
+import { stageFromFacts, modeFromFacts, BAND } from './stage-rule.mjs'
 import { actionSummary, resultSummary, category } from './summarize.mjs'
 
 const MAGIC = 0xFD2FB528
@@ -159,6 +159,41 @@ function extractUserText(content) {
   return ''
 }
 
+/** Visible-claim patterns (same as extractor-v2.mjs) — from assistant TEXT only. */
+const CLAIM_PATTERNS = [
+  ['validation_passed', /(?:测试|tests?|all)\s*(?:通过|passed)|^\s*(?:passed|success)\b|通过\b|passed\b/i],
+  ['bug_found', /发现\s*(?:bug|问题|报错)|found\s*(?:a\s*)?bug|报错|失败|failed|error/i],
+  ['approach_switched', /换(?:个|一种|了)?(?:思路|方案|方法|方向)|switch(?:ed)?\s*(?:approach|plan|strategy)|换个/i],
+  // NOTE: 只匹配"明确的交付声明"，刻意排除裸"完成/收尾/全部完成"——它们常指
+  // 子任务完成，或"讨论某里程碑词"的元文本，而非整个任务交付就绪。regex 无法区分
+  // "引用 vs 表达"，所以这里取最保守：宁可漏报 ready，不误报 false ready。
+  ['ready_to_deliver', /(?:准备|可以|即将|现在)(?:交付|提交|上线|发布)|ready\s*(?:to|for)\s*(?:deliver|ship|submit|publish)/i],
+]
+
+/** Extract visible claims from an assistant message's TEXT blocks (never reasoning). */
+function extractClaims(content) {
+  const claims = []
+  const walk = (c) => {
+    if (Array.isArray(c)) { for (const b of c) walk(b); return }
+    if (c && typeof c === 'object' && c.type === 'text' && typeof c.text === 'string') {
+      for (const [type, re] of CLAIM_PATTERNS) {
+        if (re.test(c.text)) {
+          claims.push({ type, text: c.text.replace(/\s+/g, ' ').slice(0, 120), source: 'assistant_visible_text' })
+          break
+        }
+      }
+    }
+  }
+  walk(content)
+  return claims
+}
+
+/** Is a `run` tool call actually a test run (as opposed to a generic command)? */
+function isTestCommand(name, args) {
+  const cmd = String(args?.command || args?.cmd || args?.code || args?.script || name || '').toLowerCase()
+  return /(^|\s)(pytest|jest|mocha|npm\s+(run\s+)?test|yarn\s+test|go\s+test|cargo\s+test)|test|测试|run_tests/i.test(cmd)
+}
+
 /**
  * Evaluate one session's event log.
  * @param events - parsed session events (oldest first).
@@ -180,10 +215,16 @@ export function evaluateSession(events, now = Date.now()) {
     lastResults: [], // rolling window of { error } for the most recent tool results
     usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, reasoningTokens: 0 },
     activities: [],
-    // ---- v3 prefix facts (for stage-rule) ----
+    // ---- semantic facts (for stage/mode rule) ----
+    artifacts: new Set(),          // DISTINCT successfully-created artifact paths
+    validationPassedOnce: false,   // any validation episode ever passed (monotonic)
+    validationJustFailed: false,   // most recent validation episode failed
+    validationInProgress: false,   // a test run is currently the last tool
+    readyEvidence: false,          // ready_to_deliver claim seen
+    visibleClaims: [],             // extracted assistant-text claims
+    // ---- cumulative counters (only for the offline percent model features) ----
     files: [],
     activity: [],
-    producedArtifact: false,
     writesSucceeded: 0,
     testsRun: 0,
     testsFailed: 0,
@@ -210,24 +251,44 @@ export function evaluateSession(events, now = Date.now()) {
       const argSum = (args?.file_path || args?.command || args?.pattern || args?.query || '')?.toString().slice(0, 80) || ''
       const action = actionSummary(name, args)
       state.toolCalls.push({ name, time: e.time, category: cat, args_summary: argSum, action })
-      state.lastTool = { name, time: e.time, category: cat, args_summary: argSum, action }
-      if (cat === 'write') {
-        const p = args?.file_path || args?.path
-        if (p) { state.files.push({ path: p, ext: path.extname(p) }); state.producedArtifact = true }
-      }
+      state.lastTool = { name, time: e.time, category: cat, args_summary: argSum, action, args }
+      // NOTE: artifact is NOT recorded here — it is recorded only on a SUCCESSFUL
+      // tool/result (P0 fix: a failed write must not count as first_output).
+      if (cat === 'run' && isTestCommand(name, args)) state.validationInProgress = true
     } else if (t === 'tool/result') {
       const text = extractToolText(e.data?.message)
       const isErr = ERROR_PATTERN.test(text)
+      const success = !isErr
       state.lastResults.push({ error: isErr, time: e.time, name: state.lastTool?.name ?? '?' })
       if (state.lastResults.length > 6) state.lastResults.shift()
       // semantic activity log: "做了什么 → 结果如何"
-      state.activity.push({ action: state.lastTool?.action || state.lastTool?.name, result: resultSummary(text), ok: !isErr })
+      state.activity.push({ action: state.lastTool?.action || state.lastTool?.name, result: resultSummary(text), ok: success })
       if (state.activity.length > 30) state.activity.shift()
-      // derived facts for the stage rule
-      if (state.lastTool?.category === 'write' && !isErr) state.writesSucceeded += 1
-      if (state.lastTool?.category === 'run' && /passed|failed|error/i.test(text)) {
-        state.testsRun += 1
-        if (isErr || /failed|error/i.test(text)) state.testsFailed += 1
+
+      const lt = state.lastTool
+      // artifact: ONLY on a SUCCESSFUL write, deduped by path (P0 fix)
+      if (lt?.category === 'write') {
+        const p = lt.args?.file_path || lt.args?.path
+        if (p && success) {
+          if (!state.artifacts.has(p)) {
+            state.artifacts.add(p)
+            state.files.push({ path: p, ext: path.extname(p) })
+          }
+          state.writesSucceeded += 1 // cumulative, for the offline model features
+        }
+      }
+      // validation episode: each test run closes the episode and updates state (P0 fix)
+      if (lt?.category === 'run' && state.validationInProgress) {
+        state.validationInProgress = false
+        const passed = success && !/failed|error/i.test(text)
+        if (passed) {
+          state.validationPassedOnce = true // monotonic: once passed, stage never regresses
+          state.validationJustFailed = false
+        } else {
+          state.validationJustFailed = true // mode goes rework, stage stays
+        }
+        state.testsRun += 1 // cumulative, for the offline model features
+        if (!passed) state.testsFailed += 1
       }
       if (isErr) {
         state.errors.push({
@@ -236,12 +297,20 @@ export function evaluateSession(events, now = Date.now()) {
           snippet: text.replace(/\s+/g, ' ').slice(0, 260),
         })
       }
-    } else if (t === 'assistant/message' && e.data?.usage) {
-      const u = e.data.usage
-      state.usage.inputTokens += u.inputTokens ?? 0
-      state.usage.outputTokens += u.outputTokens ?? 0
-      state.usage.cacheReadTokens += u.cacheReadTokens ?? 0
-      state.usage.reasoningTokens += u.reasoningTokens ?? 0
+    } else if (t === 'assistant/message') {
+      const u = e.data?.usage
+      if (u) {
+        state.usage.inputTokens += u.inputTokens ?? 0
+        state.usage.outputTokens += u.outputTokens ?? 0
+        state.usage.cacheReadTokens += u.cacheReadTokens ?? 0
+        state.usage.reasoningTokens += u.reasoningTokens ?? 0
+      }
+      // semantic evidence: visible claims (ready_to_deliver etc.) from assistant TEXT
+      for (const c of extractClaims(e.data?.message?.content)) {
+        if (c.type === 'ready_to_deliver') state.readyEvidence = true
+        state.visibleClaims.push(c)
+        if (state.visibleClaims.length > 15) state.visibleClaims.shift()
+      }
     }
     if (e.type === 'tool/call' || e.type === 'step/start' || e.type === 'user/message' || e.type === 'turn/end') {
       state.activities.push({ type: t, name: t === 'tool/call' ? e.data?.name : t, time: e.time })
@@ -267,19 +336,41 @@ export function evaluateSession(events, now = Date.now()) {
     ? { done: doneTodos, total: state.todos.length, percent: Math.round(todoRatio * 100), basis: 'agent-todo' }
     : null
 
-  // ---- v3 prefix-only stage + mode (qualitative, zero tokens, no future info) ----
+  // recent errors (rolling window) — used by stage facts and smoothness
+  const recentErrCount = state.lastResults.filter((r) => r.error).length
+
+  // ---- progress_stage + activity_mode (facts-based; stage monotonic because its
+  //      driving facts are monotonic: artifacts only grow, validationPassedOnce
+  //      only latches true, readyEvidence only latches true) ----
   const snap = {
     derived: {
       tests_run: state.testsRun, tests_failed: state.testsFailed,
-      writes_succeeded: state.writesSucceeded, produced_artifact: state.producedArtifact,
+      writes_succeeded: state.writesSucceeded, produced_artifact: state.artifacts.size > 0,
+      errors_total: state.errors.length, recent_errors: recentErrCount,
       todo_done: doneTodos, todo_total: state.todos.length,
-      tool_calls_total: state.toolCalls.length, recent_errors: state.lastResults.filter((r) => r.error).length,
+      tool_calls_total: state.toolCalls.length,
     },
-    observations: { files: state.files, visible_claims: [], tool_calls: state.toolCalls.slice(-20), activity: state.activity },
+    observations: {
+      files: state.files,
+      visible_claims: state.visibleClaims,
+      tool_calls: state.toolCalls.slice(-20),
+      activity: state.activity,
+    },
     interpretation: { milestones: [] },
   }
-  const stage = events.length === 0 ? 'no-data' : stagePrefix(snap)
-  const mode = modePrefix(snap)
+  const facts = {
+    toolCallsTotal: state.toolCalls.length,
+    artifactCount: state.artifacts.size,
+    validationPassedOnce: state.validationPassedOnce,
+    validationJustFailed: state.validationJustFailed,
+    validationInProgress: state.validationInProgress,
+    readyEvidence: state.readyEvidence, // ready_to_deliver claim only (completed turn is a 100% terminal, not stage=ready)
+    todoRatio,
+    recentErrors: recentErrCount,
+    lastToolCategory: state.lastTool?.category || null,
+  }
+  const stage = events.length === 0 ? 'no-data' : stageFromFacts(facts)
+  const mode = modeFromFacts(facts)
   const band = BAND[stage] ?? null
 
   // ---- current % estimate: lightweight model (prefix facts -> %), ZERO LLM ----
@@ -302,7 +393,6 @@ export function evaluateSession(events, now = Date.now()) {
   }
 
   // smoothness from the rolling window of recent tool results
-  const recentErrCount = state.lastResults.filter((r) => r.error).length
   let smoothness = 'normal'
   let smoothNote = '执行正常'
   if (status === 'stalled') { smoothness = 'stalled'; smoothNote = `疑似停滞：${Math.round(idleSec)} 秒无新活动` }

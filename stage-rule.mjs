@@ -1,18 +1,31 @@
 /**
- * stage-rule.mjs - prefix-only progress stage + activity-mode rule (v3).
+ * stage-rule.mjs - facts-based progress state rule (v2).
  *
- * The single source of truth for the stage rule, shared by:
- *   - index.mjs  (live dashboard: classify the current session)
- *   - demo.mjs   (historical replay)
+ * Stage and mode are computed from SEMANTIC FACTS, not raw counters.  Decisive
+ * changes vs the v1 snapshot-based rule:
+ *   - `ready`      requires explicit delivery evidence (ready_to_deliver claim or
+ *                  a delivered turn), NOT just any .md/.tex file.
+ *   - `validating` requires that a validation episode PASSED AT LEAST ONCE
+ *                  (monotonic), NOT that all accumulated test runs passed.
+ *   - `first_output` / `integrating` count DISTINCT successfully-created
+ *                  artifacts, not raw write attempts.
  *
- * Every condition reads PREFIX facts only (<= t): no future info, no percent
- * guess.  Mirrors label-prefix.py exactly.
+ * `stageFromFacts` is a pure function; monotonicity (stage never regresses) is
+ * the caller's job (index.mjs keeps the max stage seen so far).  `modeFromFacts`
+ * reflects what is happening RIGHT NOW (may oscillate rework <-> validating).
  *
- * A snapshot-like object has:
- *   derived  {tests_run, tests_failed, writes_succeeded, produced_artifact,
- *             todo_done, todo_total, tool_calls_total, recent_errors}
- *   observations {files:[{path}], visible_claims:[{type}], tool_calls:[{category,args_summary}]}
- *   interpretation {milestones:[{type}]}
+ * facts shape (produced by index.mjs evaluateSession):
+ * {
+ *   toolCallsTotal: number,
+ *   artifactCount: number,           // distinct successful artifacts
+ *   validationPassedOnce: boolean,   // any episode ever passed
+ *   validationJustFailed: boolean,   // most recent episode failed
+ *   validationInProgress: boolean,   // last tool is a test run
+ *   readyEvidence: boolean,          // ready_to_deliver claim OR delivered turn
+ *   todoRatio: number|null,          // plan completion ratio (0..1) or null
+ *   recentErrors: number,            // errors in the last few tool results
+ *   lastToolCategory: string|null,
+ * }
  */
 
 export const BAND = {
@@ -27,38 +40,37 @@ export const STAGE_CN = {
   planned: '规划', executing: '执行中', first_output: '初见产出',
   integrating: '整合中', validating: '验证中', ready: '可交付',
 }
-export const MODE_CN = { exploring: '探索', executing: '执行', rework: '返工', validating: '验证', delivering: '交付' }
+export const MODE_CN = { exploring: '探索', executing: '执行', rework: '返工', validating: '验证', delivering: '交付', idle: '空闲' }
 
-export function hasReport(s) {
-  const files = s.observations?.files || []
-  const claims = s.observations?.visible_claims || []
-  return files.some((f) => /\.(md|tex)$/i.test(f.path || '') || /readme/i.test(f.path || ''))
-    || claims.some((c) => c.type === 'ready_to_deliver')
+const STAGE_ORDER = ['planned', 'executing', 'first_output', 'integrating', 'validating', 'ready']
+
+/** Ordinal index of a stage (for monotonic max). */
+export function stageIndex(stage) {
+  const i = STAGE_ORDER.indexOf(stage)
+  return i === -1 ? 0 : i
 }
 
-export function stagePrefix(s) {
-  const d = s.derived || {}
-  const files = s.observations?.files || []
-  const ms = (s.interpretation?.milestones || []).map((m) => m.type)
-  if (hasReport(s)) return 'ready'
-  const testsPass = (d.tests_run >= 1 && d.tests_failed === 0) || ms.includes('validation_passed')
-  if (testsPass) return 'validating'
-  const todoRatio = d.todo_total ? d.todo_done / d.todo_total : 0
-  if (files.length >= 2 || (d.writes_succeeded || 0) >= 2 || todoRatio >= 0.6) return 'integrating'
-  if (d.produced_artifact || (d.writes_succeeded || 0) >= 1 || files.length >= 1) return 'first_output'
-  if ((d.tool_calls_total || 0) > 0) return 'executing'
+/** Highest stage among two, by monotonic order. */
+export function maxStage(a, b) {
+  return stageIndex(a) >= stageIndex(b) ? a : b
+}
+
+/** progress_stage from facts (what maturity has been GENUINELY reached). */
+export function stageFromFacts(f) {
+  if (f.readyEvidence) return 'ready'
+  if (f.validationPassedOnce) return 'validating'
+  if (f.artifactCount >= 2 || (f.todoRatio != null && f.todoRatio >= 0.6)) return 'integrating'
+  if (f.artifactCount >= 1) return 'first_output'
+  if (f.toolCallsTotal > 0) return 'executing'
   return 'planned'
 }
 
-export function modePrefix(s) {
-  const d = s.derived || {}
-  const calls = s.observations?.tool_calls || []
-  const last = calls[calls.length - 1]
-  const lastTool = last?.category || null
-  if ((d.recent_errors || 0) >= 2) return 'rework'
-  if (lastTool === 'run' && (/test/i.test(last?.args_summary || '') || (d.tests_run || 0) >= 1)) return 'validating'
-  if (lastTool === 'report' || hasReport(s)) return 'delivering'
-  if (d.produced_artifact && lastTool === 'write') return 'executing'
-  if ((d.tool_calls_total || 0) > 0 && !d.produced_artifact) return 'exploring'
-  return 'executing'
+/** activity_mode from facts (what is happening AT this moment). */
+export function modeFromFacts(f) {
+  if (f.validationJustFailed || f.recentErrors >= 2) return 'rework'
+  if (f.validationInProgress) return 'validating'
+  if (f.readyEvidence || f.lastToolCategory === 'report') return 'delivering'
+  if (f.artifactCount > 0 && f.lastToolCategory === 'write') return 'executing'
+  if (f.toolCallsTotal > 0) return 'exploring'
+  return 'idle'
 }

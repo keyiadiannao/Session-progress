@@ -7,6 +7,9 @@
   "bin": {
     "dsh-session-progress": "index.mjs"
   },
+  "scripts": {
+    "test": "node test.mjs"
+  },
   "files": [
     "index.mjs",
     "stage-rule.mjs",

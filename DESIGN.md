@@ -269,7 +269,7 @@ verified facts → workflow state → provisional plan → remaining-work foreca
 - [x] 指标：模型 MAE 18.7 pp vs 规则 27.7 pp；规模盲残差 early +15.8 / late −27.3
 - [x] gpt 三次调研（规模估计方法、进度报告范式、六方向头脑风暴）+ 独立核实
 
-## 18. 最终封口：精确 % 不可实现（2026-08-14，穷尽验证）
+## 18. 最终封口：精确 % 的经验误差地板（2026-08-14，穷尽验证）
 
 用户追问"真的实现不了吗"后，我们对 gpt 头脑风暴推荐的方向逐一做了离线验证，
 结果**三条路全部撞墙**，收敛到同一个结论：
@@ -285,12 +285,63 @@ verified facts → workflow state → provisional plan → remaining-work foreca
 | 前沿 SOTA（reasoning，条件更好） | ~16 pp | 同量级，且承认多为结构性信号 |
 
 **为什么都无效**：`进度 = 已完成/总规模`，而"总规模"是**潜在变量**，在 prefix 里
-不可观测。三条路分别用三种方式试图重建分母，都失败：
+难以观测。三条路分别用三种方式试图重建分母，都失败：
 - 子目标分解 → 子目标列表本身是推断的，分母问题在更高层级重现（gpt 预言的失败模式）；
 - LLM rollout → LLM 从 prefix 估剩余，系统性低估剩余（早期高估进度 +24pp），与"任务描述估规模"同源；
 - 直接回归 → 只能学到单调结构（early 高估 / late 低估）。
 
-**最终结论（有完整证据链）**：prefix-only 的精确 % 存在信息论下限 ~16–19pp，
-**不是我们不够努力，是信息上不可行**。我们的产品（`阶段 band 区间 + 模型中心 +
-已完成事实`）就是这个约束下最优的诚实形态。标量 % 只在**有 todo（内生分母）**时
-才可辩护，无 todo 时只能给区间。
+**最终结论（有完整证据链）**：在**当前数据、特征与已测试方法**下，prefix-only 的精确 %
+观察到约 **16–19pp 的经验误差地板**——这是实证结果，不是形式化的信息论下界证明
+（我们没有不可辨识性证明或 Bayes error lower bound，不应声称"信息论下限"）。
+我们的产品（`阶段 band 区间 + 模型中心 + 已完成事实`）是这个约束下最优的诚实形态。
+标量 % 只在**有 todo（内生分母）**时才可辩护，无 todo 时只能给区间。
+
+## 19. Runtime state machine v2（Sprint 1，暂停 ML，修 live 正确性）
+
+外部 review 指出"研究结论正确、live 实现没跟上设计"。本轮**完全不碰 ML**，把
+`stage-rule + live fact extraction + tests` 重构成 causal、event-based 的 state machine。
+
+### 修复的 P0 bug
+
+| bug | 修复 |
+|---|---|
+| write 失败也触发 first_output（artifact 在 tool/call 时记录） | artifact 只在 **tool/result 成功**后记录 |
+| files 不去重（同文件写两次 → integrating） | 用 `Set` 按 path 去重 |
+| 任意 `.md`/`.tex`/README → ready | ready 只由 `ready_to_deliver` claim 触发，不再看文件扩展名 |
+| 累计计数导致"第一次 fail 就永远进不了 validating" | 引入 **validation episode**：`validationPassedOnce` 单调闩锁 |
+
+### 状态语义（采纳 review 建议）
+
+```
+progress_stage   // 到过的最高成熟度，单调不倒退（其驱动 facts 单调：artifacts 只增、
+                 //   validationPassedOnce 只闩 true、readyEvidence 只闩 true）
+activity_mode    // 此刻在做什么，可往返（rework <-> validating）
+```
+
+- stage 判定：`readyEvidence → validating(曾通过) → integrating(≥2 artifact 或 plan≥60%)
+  → first_output(≥1 artifact) → executing → planned`
+- mode 判定：`validationJustFailed → rework`；`validationInProgress → validating`；
+  `readyEvidence → delivering` 等。
+
+### ready 判断的已知局限（regex 边界）
+
+`ready_to_deliver` 用 regex 从 assistant 文本提取，**无法区分"引用某里程碑词"vs
+"实际表达交付"**（例如 agent 写文档时引用"准备交付"这个词，或说"三件事全部完成"——
+后者是子任务完成）。因此取**最保守正则**（只匹配"准备/可以/即将 + 交付/提交/上线"
+和 "ready to deliver/ship/submit"）：
+
+- **宁可漏报 ready（停在 validating），不误报 false ready（过早 ready）**；
+- 未来改进方向：用 LLM 判断交付意图，或用结构化事件（agent 主动 emit `delivered`）。
+
+### replay 验证（7 个真实 DSH session，逐步重放）
+
+```
+stage regressions       : 0 / 224 样本 (0.0%)   ← 单调性成立
+validating oscillations : 0
+false ready             : 0（收紧后；收紧前 6/7）
+```
+
+### 测试
+
+`test.mjs` 重写为匹配新 ontology（33 项断言），覆盖上述全部 P0 修复 + zstd round-trip。
+`package.json` 增加 `scripts.test`（`npm test` 或 `node test.mjs`）。
