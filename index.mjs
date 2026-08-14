@@ -206,7 +206,12 @@ function extractClaims(content) {
 /** Is a `run` tool call actually a test run (as opposed to a generic command)? */
 function isTestCommand(name, args) {
   const cmd = String(args?.command || args?.cmd || args?.code || args?.script || name || '').toLowerCase()
-  return /(^|\s)(pytest|jest|mocha|npm\s+(run\s+)?test|yarn\s+test|go\s+test|cargo\s+test)|test|测试|run_tests/i.test(cmd)
+  // Word-anchored test-RUNNER detection only.  A bare `test`/`测试` substring is
+  // far too broad: `grep "tests passed" README.md` (or any command mentioning
+  // "test"/"latest"/"contest") would be mistaken for a validation run.  This
+  // tightens the lexical false-positive class (review #3); typed evidence is the
+  // eventual replacement.
+  return /(^|\s)(?:pytest|jest|mocha|npm\s+(?:run\s+)?test|yarn\s+test|go\s+test|cargo\s+test|run_tests)\b/i.test(cmd)
 }
 
 /**
@@ -238,7 +243,7 @@ export function evaluateSession(events, now = Date.now()) {
     validatedRevision: 0,          // artifact revision at the last validation PASS
     validationPassedOnce: false,   // any validation episode ever passed (monotonic)
     validationJustFailed: false,   // most recent validation episode failed
-    validationInProgress: false,   // a test run is currently the last tool
+    validationInProgress: false,   // a test run is currently in flight (drives 'validating' mode)
     readyClaim: false,             // ready_to_deliver claim seen (a CLAIM, not a fact)
     visibleClaims: [],             // extracted assistant-text claims
     // ---- cumulative counters (only for the offline percent model features) ----
@@ -272,13 +277,18 @@ export function evaluateSession(events, now = Date.now()) {
       if (typeof args === 'string') { try { args = JSON.parse(args) } catch { args = {} } }
       const argSum = (args?.file_path || args?.command || args?.pattern || args?.query || '')?.toString().slice(0, 80) || ''
       const action = actionSummary(name, args)
-      const callInfo = { name, time: e.time, category: cat, args_summary: argSum, action, args, callId }
+      // isValidation is decided AT CALL TIME and carried on the call record, so the
+      // matching tool/result can close the episode by call identity — NOT via a
+      // global flag (which interleaves wrongly: a `pwd` result must not close a
+      // `pytest` episode).
+      const isValidation = cat === 'run' && isTestCommand(name, args)
+      const callInfo = { name, time: e.time, category: cat, args_summary: argSum, action, args, callId, isValidation }
       state.toolCalls.push(callInfo)
       state.lastTool = callInfo // fallback for results that lack a callId
       if (callId) state.pendingCalls.set(callId, callInfo)
       // NOTE: artifact is NOT recorded here — it is recorded only on a SUCCESSFUL
       // tool/result (a failed write must not count as first_output).
-      if (cat === 'run' && isTestCommand(name, args)) state.validationInProgress = true
+      if (isValidation) state.validationInProgress = true
     } else if (t === 'tool/result') {
       // P0: associate result with its call by callId, NOT by lastTool (handles
       // parallel / interleaved tool calls).  isError field is authoritative.
@@ -308,12 +318,13 @@ export function evaluateSession(events, now = Date.now()) {
           state.artifactRevision += 1 // every successful write (create OR modify) advances revision
         }
       }
-      // validation episode: each test run closes the episode and updates state
-      if (lt?.category === 'run' && state.validationInProgress) {
+      // validation episode: only the ACTUAL test call's result closes the episode
+      // (call identity via pendingCalls, not a global in-progress flag).
+      if (lt?.isValidation) {
         state.validationInProgress = false
         const passed = success && !/failed|error/i.test(text)
         if (passed) {
-          state.validationPassedOnce = true // monotonic: once passed, stage never regresses
+          state.validationPassedOnce = true // latches true; but stage can still drop via validationStale (§21)
           state.validationJustFailed = false
           state.validatedRevision = state.artifactRevision // bind validation to the current revision
         } else {
@@ -378,9 +389,9 @@ export function evaluateSession(events, now = Date.now()) {
   // recent errors (rolling window) — used by stage facts and smoothness
   const recentErrCount = state.lastResults.filter((r) => r.error).length
 
-  // ---- progress_stage + activity_mode (facts-based; stage monotonic because its
-  //      driving facts are monotonic: artifacts only grow, validationPassedOnce
-  //      only latches true, readyEvidence only latches true) ----
+  // ---- progress_stage + activity_mode (facts-based; post-§21 semantics — stage is
+  //      NOT monotonic: validationStale drops a validating stage back, and the ready
+  //      conjunction can lower it too; see stage-rule.mjs / DESIGN.md §21) ----
   const snap = {
     derived: {
       tests_run: state.testsRun, tests_failed: state.testsFailed,

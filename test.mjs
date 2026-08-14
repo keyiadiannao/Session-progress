@@ -177,6 +177,39 @@ function testPair(t, passed) {
   check('re-validate after modify -> mode not rework (fresh again)', a.mode !== 'rework', a.mode)
 }
 
+// --- review: interleaved result must NOT close a test episode (callId-scoped) ---
+// A `pwd` result arriving before the `pytest` result must not close the episode
+// (the old global validationInProgress flag interleaved wrongly).  Exercises the
+// real callId -> pendingCalls join path.
+{
+  const ev = [
+    mk('turn/start', 0, { turn: 1 }),
+    mk('user/message', 1, { content: '测试 + 检查目录' }),
+    mk('tool/call', 10, { name: 'pwsh', callId: 'T', arguments: { command: 'pytest -q' } }),
+    mk('tool/call', 11, { name: 'pwsh', callId: 'B', arguments: { command: 'pwd' } }),
+    mk('tool/result', 12, { message: { source: { callId: 'B' }, content: [{ type: 'text', text: '/home' }] } }),
+    mk('tool/result', 13, { message: { source: { callId: 'T' }, content: [{ type: 'text', text: '3 passed' }] } }),
+  ]
+  const prefix = evaluateSession(ev.slice(0, 5), t0 + 2000) // through the pwd result
+  check('interleaved: pwd result does NOT close pytest episode (mode stays validating)', prefix.mode === 'validating', prefix.mode)
+  check('interleaved: no premature validating stage from pwd', prefix.stage !== 'validating', prefix.stage)
+  const full = evaluateSession(ev, t0 + 2000)
+  check('interleaved: real test result still reaches validating', full.stage === 'validating', full.stage)
+}
+
+// --- review: a successful command MENTIONING "test" is NOT a validation run ---
+{
+  const ev = [
+    mk('turn/start', 0, { turn: 1 }),
+    mk('user/message', 1, { content: 'grep tests' }),
+    mk('tool/call', 10, { name: 'pwsh', arguments: { command: 'grep -n "tests passed" README.md' } }),
+    mk('tool/result', 11, { message: { content: [{ type: 'text', text: '3: tests passed' }] } }),
+  ]
+  const a = evaluateSession(ev, t0 + 2000)
+  check('command mentioning "tests" -> NOT validating stage (bare |test| removed)', a.stage !== 'validating', a.stage)
+  check('command mentioning "tests" -> mode not validating', a.mode !== 'validating', a.mode)
+}
+
 // --- basic status/task/todo/errors/usage still work ---
 {
   const ev = [
