@@ -1,0 +1,40 @@
+{
+  "name": "dsh-session-progress",
+  "version": "0.1.0",
+  "description": "Independent, honest progress monitor for the current AI agent session: reads the session log and reports a four-panel view (Stage / Plan / Evidence / Health) as an external signal, never written into the conversation. Reports defensible intervals + facts instead of a fake precise percentage.",
+  "type": "module",
+  "main": "index.mjs",
+  "bin": {
+    "dsh-session-progress": "index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "stage-rule.mjs",
+    "summarize.mjs",
+    "summarizer.mjs",
+    "llm.mjs",
+    "extractor-v2.mjs",
+    "extractor-v2-claude.mjs",
+    "extract-snapshots.mjs",
+    "claude-extract.mjs",
+    "percent-model.json",
+    "config.example.json",
+    "start-dashboard.bat",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "session",
+    "progress",
+    "evaluation",
+    "monitor",
+    "dashboard"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19"
+  }
+}

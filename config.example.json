@@ -1,0 +1,7 @@
+{
+  "port": 3278,
+  "sessionsRoot": "~/.dsh/sessions",
+  "sessionDir": "",
+  "pollMs": 2000,
+  "stallSeconds": 60
+}

@@ -1,0 +1,18 @@
+# 隐私：真实会话数据（含任务描述、文件路径、用户指令、命令内容），绝不提交
+dataset/
+
+# 本地配置（含本地路径；用 config.example.json 作模板）
+config.json
+
+# 模型二进制（用 research/ 脚本重新训练，不提交训练产物）
+*.pkl
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 演示产物
+demo.html
+
+# 日志
+*.log
